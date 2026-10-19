@@ -30,6 +30,8 @@ import android.net.NetworkRequest;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -47,7 +49,14 @@ import android.widget.ScrollView;
 import android.widget.TextClock;
 import android.widget.TextView;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -67,6 +76,9 @@ public class MainActivity extends Activity {
     // it there, off until picked the same way:
     //   --es quick "bluetooth,sound,picture"
     // (--es quick none  takes them away again; "wifi" and "ethernet" are the network tile now).
+    // A wallpaper from konachan.com, changed every so often while the home screen is used. Pick it on
+    // the TV by holding OK (or pressing Menu) on Settings, or with:
+    //   --es wallpaper sfw|nsfw|explicit|any|off  --es wallpaper_every 30  --es wallpaper_tags "scenic"
     private static final String PREFS = "config";
     private static final List<String> NOT_APPS = Arrays.asList("com.android.vending", "com.android.tv.settings",
             "com.android.tv", "com.google.android.tvlauncher", "com.google.android.apps.tv.launcherx",
@@ -202,7 +214,10 @@ public class MainActivity extends Activity {
     private boolean saveConfig(Intent intent) {
         String apps = intent == null ? null : intent.getStringExtra("apps");
         String quick = intent == null ? null : intent.getStringExtra("quick");
-        if (apps == null && quick == null) return false;
+        String wall = intent == null ? null : intent.getStringExtra("wallpaper");
+        String wallTags = intent == null ? null : intent.getStringExtra("wallpaper_tags");
+        String wallEvery = intent == null ? null : intent.getStringExtra("wallpaper_every");
+        if (apps == null && quick == null && wall == null && wallTags == null && wallEvery == null) return false;
         SharedPreferences prefs = getSharedPreferences(PREFS, 0);
         String stamp = intent.getStringExtra("stamp");
         if (stamp != null && stamp.equals(prefs.getString("stamp", null))) return false;
@@ -218,6 +233,14 @@ public class MainActivity extends Activity {
             if (quick.isEmpty() || quick.equalsIgnoreCase("none")) e.remove("quick");
             else e.putString("quick", quick);
         }
+        if (wall != null && Arrays.asList(WALL_MODES).contains(wall.trim().toLowerCase())) {
+            e.putString("wall_mode", wall.trim().toLowerCase()).putLong("wall_last", 0);
+            if (wall.trim().equalsIgnoreCase("off")) removeWallpaper();
+        }
+        if (wallTags != null) e.putString("wall_tags", wallTags.trim()).putLong("wall_last", 0);
+        if (wallEvery != null) try {
+            e.putInt("wall_every", Math.max(5, Integer.parseInt(wallEvery.trim())));
+        } catch (NumberFormatException ignored) {}
         e.apply();
         dirty = true;
         return true;
@@ -254,8 +277,17 @@ public class MainActivity extends Activity {
         }
         refreshNetwork();
         refreshWallpaper();
+        resumed = true;
+        nextWallpaper();
         View f = getCurrentFocus();
         if (f == null && !tiles.isEmpty()) tiles.get(0).requestFocus();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        resumed = false;
+        handler.removeCallbacks(wallTick);
     }
 
     // The TV's language changed: start over so the labels and the date follow it.
@@ -332,6 +364,126 @@ public class MainActivity extends Activity {
         } catch (Throwable t) { // a broken file or out of memory: keep what's shown
             return null;
         }
+    }
+
+    private static final String[] WALL_MODES = {"off", "sfw", "nsfw", "explicit", "any"};
+    private static final String[] WALL_LABELS = {"Off", "Anime (safe)", "Anime (NSFW)", "Anime (explicit only)",
+            "Anime (any rating)"};
+    private static final int[] WALL_EVERY = {15, 30, 60, 180, 720, 1440}; // minutes
+    private static final String KONACHAN = "https://konachan.com/post.json?limit=40&tags=";
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Runnable wallTick = this::nextWallpaper;
+    private boolean resumed, fetching;
+
+    // Fetches a new wallpaper once it's due, and while the home screen stays up, waits for the next.
+    // Nothing runs in the background: a wallpaper that came due meanwhile is fetched on the way home.
+    private void nextWallpaper() {
+        handler.removeCallbacks(wallTick);
+        SharedPreferences p = getSharedPreferences(PREFS, 0);
+        String mode = p.getString("wall_mode", "off");
+        if ("off".equals(mode) || fetching) return;
+        long every = p.getInt("wall_every", 30) * 60000L;
+        long wait = p.getLong("wall_last", 0) + every - System.currentTimeMillis();
+        if (wait > 0) {
+            if (resumed) handler.postDelayed(wallTick, wait);
+            return;
+        }
+        fetching = true;
+        final String tags = p.getString("wall_tags", "");
+        final File dir = getExternalFilesDir(null);
+        new Thread(() -> {
+            final boolean ok = dir != null && downloadWallpaper(mode, tags, dir);
+            runOnUiThread(() -> {
+                fetching = false;
+                // Offline or Konachan down: try again in 5 minutes.
+                long last = ok ? System.currentTimeMillis() : System.currentTimeMillis() - every + 5 * 60000L;
+                getSharedPreferences(PREFS, 0).edit().putLong("wall_last", last).apply();
+                if (ok) refreshWallpaper();
+                if (resumed) nextWallpaper();
+            });
+        }).start();
+    }
+
+    // A random landscape picture at least 1920 wide. Nothing with minors in a sexual context, whatever
+    // the rating: left out by the search and again here.
+    private static boolean downloadWallpaper(String mode, String extra, File dir) {
+        String rating = "sfw".equals(mode) ? "rating:s" : "nsfw".equals(mode) ? "-rating:s"
+                : "explicit".equals(mode) ? "rating:e" : "";
+        String tags = ("order:random width:1920.. " + rating + " -loli -shota " + extra).trim().replaceAll("\\s+", " ");
+        File tmp = new File(dir, "wallpaper.tmp");
+        try {
+            org.json.JSONArray posts = new org.json.JSONArray(
+                    new String(get(KONACHAN + URLEncoder.encode(tags, "UTF-8")), "UTF-8"));
+            String url = null;
+            for (int i = 0; i < posts.length() && url == null; i++) {
+                org.json.JSONObject o = posts.getJSONObject(i);
+                String t = " " + o.optString("tags") + " ";
+                if (o.optInt("width") < o.optInt("height") * 1.3 || t.matches(".* (loli|shota|child|toddler) .*")) continue;
+                url = o.optString("jpeg_url", null);
+            }
+            if (url == null) return false;
+            try (OutputStream out = new FileOutputStream(tmp)) { out.write(get(url)); }
+            return tmp.renameTo(new File(dir, "wallpaper.jpg"));
+        } catch (Throwable t) {
+            tmp.delete();
+            return false;
+        }
+    }
+
+    private static byte[] get(String url) throws java.io.IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(15000);
+        c.setReadTimeout(30000);
+        c.setRequestProperty("User-Agent", "tv-detox-home");
+        try (InputStream in = c.getInputStream()) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[16384];
+            for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
+            return out.toByteArray();
+        } finally {
+            c.disconnect();
+        }
+    }
+
+    private void removeWallpaper() {
+        File dir = getExternalFilesDir(null);
+        if (dir != null) new File(dir, "wallpaper.jpg").delete();
+    }
+
+    // Hold OK (or Menu) on Settings: pick the wallpaper, how often it changes, or get a new one now.
+    private void showWallpaperMenu() {
+        final SharedPreferences p = getSharedPreferences(PREFS, 0);
+        final String mode = p.getString("wall_mode", "off");
+        final int every = p.getInt("wall_every", 30);
+        final boolean on = !"off".equals(mode);
+        List<String> labels = new ArrayList<>();
+        for (int i = 0; i < WALL_MODES.length; i++) labels.add(WALL_LABELS[i] + (WALL_MODES[i].equals(mode) ? "  ✓" : ""));
+        if (on) {
+            labels.add("Change every " + minutes(every));
+            labels.add("New picture now");
+        }
+        panel("Wallpaper", labels, null, which -> {
+            if (which < WALL_MODES.length) {
+                p.edit().putString("wall_mode", WALL_MODES[which]).putLong("wall_last", 0).apply();
+                if (which == 0) { removeWallpaper(); refreshWallpaper(); }
+                nextWallpaper();
+            } else if (which == WALL_MODES.length) {
+                List<String> times = new ArrayList<>();
+                for (int m : WALL_EVERY) times.add(minutes(m) + (m == every ? "  ✓" : ""));
+                panel("Change every", times, null, t -> {
+                    p.edit().putInt("wall_every", WALL_EVERY[t]).apply();
+                    nextWallpaper();
+                });
+            } else {
+                p.edit().putLong("wall_last", 0).apply();
+                nextWallpaper();
+            }
+        });
+    }
+
+    private static String minutes(int m) {
+        return m < 60 ? m + " min" : m % 60 == 0 && m < 1440 ? m / 60 + (m == 60 ? " hour" : " hours")
+                : m == 1440 ? "day" : m + " min";
     }
 
     private static GradientDrawable radial(int color, float cx, float cy, float r) {
@@ -481,16 +633,16 @@ public class MainActivity extends Activity {
                     .setDuration(140).withLayer().start();
             if (caption != null) caption.setVisibility(has ? View.VISIBLE : View.INVISIBLE);
         });
-        final boolean editable = rowApps.contains(key);
+        final boolean editable = rowApps.contains(key) || SETTINGS.equals(key);
         card.setOnClickListener(v -> open(key));
-        if (editable) card.setOnLongClickListener(v -> { showEditMenu(key); return true; });
+        if (editable) card.setOnLongClickListener(v -> { showMenu(key); return true; });
         card.setOnKeyListener((v, code, ev) -> {
             boolean ok = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER
                     || code == KeyEvent.KEYCODE_NUMPAD_ENTER;
             boolean down = ev.getAction() == KeyEvent.ACTION_DOWN;
             if (key.equals(movingKey)) return moveKey(key, code, ok, down);
             if (editable && code == KeyEvent.KEYCODE_MENU) {
-                if (!down) showEditMenu(key);
+                if (!down) showMenu(key);
                 return true;
             }
             if (!ok) return false;
@@ -499,7 +651,7 @@ public class MainActivity extends Activity {
                 else if (editable && !longPressed && (ev.isLongPress()
                         || ev.getEventTime() - ev.getDownTime() >= ViewConfiguration.getLongPressTimeout())) {
                     longPressed = true;
-                    showEditMenu(key);
+                    showMenu(key);
                 }
             } else if (!longPressed) {
                 open(key);
@@ -837,6 +989,11 @@ public class MainActivity extends Activity {
         lp.height = h;
         win.setAttributes(lp);
         d.show();
+    }
+
+    private void showMenu(String key) {
+        if (SETTINGS.equals(key)) showWallpaperMenu();
+        else showEditMenu(key);
     }
 
     // Hold OK (or Menu) on a top-row app: move it, swap it for another, or take it off the home
