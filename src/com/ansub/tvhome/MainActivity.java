@@ -11,6 +11,7 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -131,6 +132,7 @@ public class MainActivity extends Activity {
         loadFonts();
         scale = getResources().getDisplayMetrics().widthPixels / 1920f;
         getWindow().setBackgroundDrawable(background());
+        refreshWallpaper();
 
         ScrollView scroller = new ScrollView(this);
         scroller.setFillViewport(true);
@@ -251,6 +253,7 @@ public class MainActivity extends Activity {
             buildTiles();
         }
         refreshNetwork();
+        refreshWallpaper();
         View f = getCurrentFocus();
         if (f == null && !tiles.isEmpty()) tiles.get(0).requestFocus();
     }
@@ -273,6 +276,62 @@ public class MainActivity extends Activity {
         GradientDrawable plum = radial(0x2EAA3C8C, 1.0f, 1.1f, px(1000));
         for (GradientDrawable g : new GradientDrawable[] {base, warm, plum}) g.setDither(true);
         return new LayerDrawable(new Drawable[] {base, warm, plum});
+    }
+
+    // Optional wallpaper, pushed by wallpaper.sh to the app's own folder (no storage permission needed):
+    //   /sdcard/Android/data/com.ansub.tvhome/files/wallpaper.jpg
+    // Checked when the home screen comes back, and only decoded again when the file changed.
+    // Delete the file to get the gradient back.
+    private String shownWallpaper = "";
+
+    private void refreshWallpaper() {
+        File dir = getExternalFilesDir(null);
+        if (dir == null) return;
+        final File f = new File(dir, "wallpaper.jpg");
+        final String key = f.exists() ? f.lastModified() + ":" + f.length() : "";
+        if (key.equals(shownWallpaper)) return;
+        shownWallpaper = key;
+        if (key.isEmpty()) { getWindow().setBackgroundDrawable(background()); return; }
+        final int w = getResources().getDisplayMetrics().widthPixels, h = getResources().getDisplayMetrics().heightPixels;
+        new Thread(() -> {
+            final Bitmap b = loadWallpaper(f, w, h);
+            if (b == null) return;
+            runOnUiThread(() -> {
+                if (!key.equals(shownWallpaper) || isFinishing()) return;
+                // Darker at the top (clock) and bottom (apps) so white text stays readable.
+                GradientDrawable scrim = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                        new int[] {0x8C000000, 0x33000000, 0x40000000, 0xB3000000});
+                scrim.setDither(true);
+                getWindow().setBackgroundDrawable(new LayerDrawable(new Drawable[] {
+                        new BitmapDrawable(getResources(), b), scrim}));
+            });
+        }).start();
+    }
+
+    // Decodes just big enough for the screen, then crops to fill it.
+    private static Bitmap loadWallpaper(File f, int w, int h) {
+        try {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(f.getPath(), o);
+            if (o.outWidth <= 0 || o.outHeight <= 0) return null;
+            int sample = 1;
+            while (o.outWidth / (sample * 2) >= w && o.outHeight / (sample * 2) >= h) sample *= 2;
+            o = new BitmapFactory.Options();
+            o.inSampleSize = sample;
+            Bitmap src = BitmapFactory.decodeFile(f.getPath(), o);
+            if (src == null) return null;
+            float s = Math.max(w / (float) src.getWidth(), h / (float) src.getHeight());
+            Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            Canvas c = new Canvas(out);
+            c.translate((w - src.getWidth() * s) / 2f, (h - src.getHeight() * s) / 2f);
+            c.scale(s, s);
+            c.drawBitmap(src, 0, 0, new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG));
+            src.recycle();
+            return out;
+        } catch (Throwable t) { // a broken file or out of memory: keep what's shown
+            return null;
+        }
     }
 
     private static GradientDrawable radial(int color, float cx, float cy, float r) {
