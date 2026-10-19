@@ -1,5 +1,7 @@
 #!/bin/sh
 # Sets the home screen wallpaper to a random picture from konachan.com. Needs adb, curl and jq.
+# The home screen can also do this by itself, no computer needed: on the TV, hold OK (or press
+# Menu) on Settings and pick a wallpaper. This script is for one-offs and your own pictures.
 #
 #   sh wallpaper.sh <TV_IP>                       safe for work (default)
 #   sh wallpaper.sh <TV_IP> nsfw                  questionable and explicit
@@ -14,7 +16,7 @@
 set -e
 
 TARGET="$1"; MODE="${2:-sfw}"; EXTRA="$3"
-[ -n "$TARGET" ] || { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+[ -n "$TARGET" ] || { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 for c in adb curl jq; do
   command -v $c >/dev/null 2>&1 || { echo "$c is missing. Install it first." >&2; exit 1; }
 done
